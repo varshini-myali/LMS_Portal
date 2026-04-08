@@ -1,52 +1,78 @@
-// src/middleware/auth.js
-const jwt = require('jsonwebtoken');
+// src/routes/auth.js
+const express   = require('express');
+const { body, validationResult } = require('express-validator');
+const authSvc   = require('../services/authService');
+const router    = express.Router();
 
-/**
- * requireAuth – verifies the Bearer access token.
- * Attaches req.user = { id, email, role } on success.
- */
-const requireAuth = (req, res, next) => {
-  const header = req.headers.authorization;
-  if (!header?.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Missing or malformed Authorization header' });
-  }
+const COOKIE_NAME = 'lms_refresh';
 
-  const token = header.slice(7);
-  try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = { id: payload.sub, email: payload.email, role: payload.role };
-    next();
-  } catch (err) {
-    if (err.name === 'TokenExpiredError') {
-      return res.status(401).json({ error: 'Access token expired', code: 'TOKEN_EXPIRED' });
+function setCookie(res, token) {
+  res.cookie(COOKIE_NAME, token, {
+    httpOnly: true,
+    secure:   process.env.COOKIE_SECURE === 'true',
+    sameSite: 'lax',
+    maxAge:   Number(process.env.REFRESH_TOKEN_EXPIRES_DAYS || 30) * 86_400_000,
+    path:     '/api/auth',
+  });
+}
+
+function validate(req, res, next) {
+  const errs = validationResult(req);
+  if (!errs.isEmpty()) return res.status(422).json({ errors: errs.array() });
+  next();
+}
+
+// POST /api/auth/register
+router.post('/register',
+  body('name').trim().isLength({ min: 2, max: 120 }),
+  body('email').isEmail().normalizeEmail(),
+  body('password').isLength({ min: 6 }),
+  validate,
+  async (req, res) => {
+    try {
+      const { user, accessToken, refreshToken } = await authSvc.register(req.body);
+      setCookie(res, refreshToken);
+      res.status(201).json({ user, accessToken });
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
     }
-    return res.status(401).json({ error: 'Invalid access token' });
   }
-};
+);
 
-/**
- * optionalAuth – same as requireAuth but doesn't abort if missing.
- * Useful for public endpoints that behave differently when logged in.
- */
-const optionalAuth = (req, res, next) => {
-  const header = req.headers.authorization;
-  if (!header?.startsWith('Bearer ')) return next();
+// POST /api/auth/login
+router.post('/login',
+  body('email').isEmail().normalizeEmail(),
+  body('password').notEmpty(),
+  validate,
+  async (req, res) => {
+    try {
+      const { user, accessToken, refreshToken } = await authSvc.login(req.body);
+      setCookie(res, refreshToken);
+      res.json({ user, accessToken });
+    } catch (err) {
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  }
+);
+
+// POST /api/auth/refresh
+router.post('/refresh', async (req, res) => {
   try {
-    const token   = header.slice(7);
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = { id: payload.sub, email: payload.email, role: payload.role };
-  } catch (_) { /* ignore */ }
-  next();
-};
-
-/**
- * requireRole – factory for role-based guards (use after requireAuth).
- */
-const requireRole = (...roles) => (req, res, next) => {
-  if (!req.user || !roles.includes(req.user.role)) {
-    return res.status(403).json({ error: 'Forbidden' });
+    const raw = req.cookies?.[COOKIE_NAME];
+    const { user, accessToken, refreshToken } = await authSvc.refresh(raw);
+    setCookie(res, refreshToken);
+    res.json({ user, accessToken });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
   }
-  next();
-};
+});
 
-module.exports = { requireAuth, optionalAuth, requireRole };
+// POST /api/auth/logout
+router.post('/logout', async (req, res) => {
+  const raw = req.cookies?.[COOKIE_NAME];
+  await authSvc.logout(raw);
+  res.clearCookie(COOKIE_NAME, { path: '/api/auth' });
+  res.json({ message: 'Logged out' });
+});
+
+module.exports = router;
